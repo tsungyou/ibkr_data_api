@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ibkr-data"
+version = "0.1.0"
+description = "Download Interactive Brokers historical bars into pandas DataFrames."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "ibkr-data contributors" }]
+keywords = ["interactive-brokers", "ibkr", "ibapi", "market-data", "pandas"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "pandas>=1.5",
+    "ibapi>=9.81.1.post1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "build>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tsungyou/ibkr_data_api"
+Repository = "https://github.com/tsungyou/ibkr_data_api"
+Issues = "https://github.com/tsungyou/ibkr_data_api/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ibkr_data = ["py.typed"]
