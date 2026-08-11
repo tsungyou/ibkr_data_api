@@ -1,6 +1,12 @@
 """
 最小 IB 歷史下載：連 TWS → reqHistoricalData → DataFrame
 
+時間約定（固定美國東部，自動含夏令時 EST/EDT）：
+  - 請求 endDateTime 使用 US/Eastern
+  - start_da / end_da / 「今天」皆以 America/New_York 曆日為準
+  - 日內 bar 的 ts 為 tz-aware（America/New_York），不做亞洲本機時區換算
+  - 日線 da 為美國交易日曆日期（與「香港今天」無關）
+
 前置：TWS/Gateway 已開，API port 預設 7496（live）或 7497（paper）。
 
 用法：
@@ -29,6 +35,7 @@ import time
 from datetime import date, datetime
 from enum import Enum
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from ibapi.client import EClient
@@ -40,6 +47,11 @@ IB_HOST = "127.0.0.1"
 IB_PORT = 7496  # paper 常用 7497
 IB_CLIENT_ID = 101  # 勿與其他連線撞號
 PACING_SEC = 11.0  # 多檔 / 多段請求間隔，避開 IB pacing
+
+# 美股時間軸（會自動處理夏令時：EST ↔ EDT）
+US_EASTERN = ZoneInfo("America/New_York")
+US_EASTERN_NAME = "America/New_York"
+IB_END_TZ_LABEL = "US/Eastern"  # IB endDateTime 官方認可字串
 
 
 # ── 人性化參數（對應 IB 字串，避免 typo）─────────────────────
@@ -165,11 +177,24 @@ def _normalize_codes(codes: Union[str, Sequence[str], Iterable[str]]) -> List[st
     return out
 
 
+def _today_us() -> date:
+    """美國東部「今天」（與香港本地 date.today() 可能差一天）。"""
+    return datetime.now(US_EASTERN).date()
+
+
 def _parse_da(value: Union[str, date, datetime]) -> date:
-    """'2024-01-01' / '20240101' / date / datetime → date。"""
+    """
+    解析為「美國交易日曆」日期。
+
+    - 字串 '2024-01-01'：直接當美東曆日（不依你電腦時區）
+    - aware datetime：先轉 America/New_York 再取 .date()
+    - naive datetime：視為已是美東牆上時間
+    """
     if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(US_EASTERN).date()
         return value.date()
-    if isinstance(value, date):
+    if isinstance(value, date) and not isinstance(value, datetime):
         return value
     s = str(value).strip()
     if not s:
@@ -179,13 +204,58 @@ def _parse_da(value: Union[str, date, datetime]) -> date:
             return datetime.strptime(s, fmt).date()
         except ValueError:
             continue
-    # 交給 pandas 兜底
-    return pd.to_datetime(s).date()
+    ts = pd.to_datetime(s)
+    if getattr(ts, "tzinfo", None) is not None:
+        return ts.tz_convert(US_EASTERN_NAME).date()
+    return ts.date()
 
 
-def _format_ib_end(end: date, market_tz: str = "US/Eastern") -> str:
-    """IB endDateTime：該日收盤後，往回推 duration。"""
-    return end.strftime("%Y%m%d") + f" 23:59:59 {market_tz}"
+def _format_ib_end(end: date) -> str:
+    """IB endDateTime：美東該日 23:59:59（明確標 US/Eastern，不受本機時區影響）。"""
+    return end.strftime("%Y%m%d") + f" 23:59:59 {IB_END_TZ_LABEL}"
+
+
+def _parse_ib_bar_time(raw: str, *, is_daily: bool) -> Union[date, pd.Timestamp]:
+    """
+    把 IB 回傳的 date 字串解成美東時間。
+
+    formatDate=1：
+      日線  : 'YYYYMMDD'
+      日內  : 'YYYYMMDD  HH:MM:SS'（字串無時區；對美股視為 America/New_York 牆上時間）
+    """
+    s = str(raw).strip()
+    if is_daily:
+        return datetime.strptime(s[:8], "%Y%m%d").date()
+
+    # 去掉多餘空白：'20240601  09:35:00' → '20240601 09:35:00'
+    parts = s.split()
+    if len(parts) >= 2:
+        compact = f"{parts[0][:8]} {parts[1]}"
+    else:
+        compact = s[:8] + " 00:00:00"
+
+    naive = datetime.strptime(compact, "%Y%m%d %H:%M:%S")
+    ts = pd.Timestamp(naive)
+    # ambiguous 處理夏令時「重複那一小時」；nonexistent 處理「跳過的那一小時」
+    try:
+        return ts.tz_localize(
+            US_EASTERN_NAME,
+            ambiguous="infer",
+            nonexistent="shift_forward",
+        )
+    except (ValueError, TypeError):
+        try:
+            return ts.tz_localize(
+                US_EASTERN_NAME,
+                ambiguous=True,
+                nonexistent="shift_forward",
+            )
+        except Exception:
+            return ts.tz_localize(
+                US_EASTERN_NAME,
+                ambiguous=False,
+                nonexistent="shift_forward",
+            )
 
 
 def _resolve_request_window(
@@ -196,23 +266,14 @@ def _resolve_request_window(
     """
     回傳 (end_dt 字串給 IB, duration_str 給 IB, filter_start, filter_end)。
 
-    模式 A — 指定區間（有 start_da）：
-        IB 只認 endDateTime + durationStr，所以：
-          endDateTime = end_da 當天 23:59:59
-          durationStr = (end - start).days + 1 天（再加緩衝 1 天）
-        抓完後用 filter_start/end 裁成精確區間。
-
-    模式 B — 相對期間（只有 duration，可選 end_da）：
-        endDateTime = end_da 或 ""（最新）
-        durationStr = duration
-        無 filter（若有 end_da 則只裁 end 側也可，此處僅裁 end_da 日）
+    日期皆以美東曆日為準；endDateTime 固定帶 US/Eastern。
     """
     if start_da is not None:
         start = _parse_da(start_da)
-        end = _parse_da(end_da) if end_da is not None else date.today()
+        end = _parse_da(end_da) if end_da is not None else _today_us()
         if start > end:
             raise ValueError(f"start_da ({start}) 不可晚於 end_da ({end})")
-        # 含首尾 + 1 天緩衝，避免時區/週末邊界少一天
+        # 含首尾 + 1 天緩衝，避免週末邊界少一天
         n_days = (end - start).days + 2
         n_days = max(n_days, 1)
         return (
@@ -222,7 +283,6 @@ def _resolve_request_window(
             end,
         )
 
-    # 純相對期間
     if duration is None:
         duration = Duration.ONE_YEAR
     duration_str = _as_duration(duration)
@@ -252,13 +312,25 @@ def _filter_by_dates(
             out = out[series <= end]
     else:
         ts = pd.to_datetime(out["ts"])
+        # 一律帶到美東再比，避免 naive / UTC 混用
+        if getattr(ts.dt, "tz", None) is None:
+            ts = ts.dt.tz_localize(US_EASTERN_NAME, ambiguous="infer", nonexistent="shift_forward")
+        else:
+            ts = ts.dt.tz_convert(US_EASTERN_NAME)
         if start is not None:
-            start_ts = pd.Timestamp(start)
+            start_ts = pd.Timestamp(start, tz=US_EASTERN_NAME)
             out = out[ts >= start_ts]
             ts = pd.to_datetime(out["ts"])
+            if getattr(ts.dt, "tz", None) is None:
+                ts = ts.dt.tz_localize(US_EASTERN_NAME, ambiguous="infer", nonexistent="shift_forward")
+            else:
+                ts = ts.dt.tz_convert(US_EASTERN_NAME)
         if end is not None:
-            # 含 end 整天
-            end_ts = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+            end_ts = (
+                pd.Timestamp(end, tz=US_EASTERN_NAME)
+                + pd.Timedelta(days=1)
+                - pd.Timedelta(microseconds=1)
+            )
             out = out[ts <= end_ts]
     return out.reset_index(drop=True)
 
@@ -355,14 +427,8 @@ class IBHistClient(EWrapper, EClient):
         rows = []
         for b in self._bars:
             raw = str(b.date)
-            if is_daily:
-                da = raw[:8]
-                ts_or_da = datetime.strptime(da, "%Y%m%d").date()
-                key = "da"
-            else:
-                # 日內通常是 "YYYYMMDD  HH:MM:SS"
-                ts_or_da = pd.to_datetime(raw)
-                key = "ts"
+            ts_or_da = _parse_ib_bar_time(raw, is_daily=is_daily)
+            key = "da" if is_daily else "ts"
             rows.append(
                 {
                     key: ts_or_da,
@@ -375,6 +441,8 @@ class IBHistClient(EWrapper, EClient):
                     "wap": getattr(b, "average", None),
                     "bar_count": getattr(b, "barCount", None),
                     "bar_size": bar_size_str,
+                    "date_raw": raw,
+                    "tz": US_EASTERN_NAME,
                 }
             )
         return pd.DataFrame(rows)
@@ -423,6 +491,13 @@ def download(
         "YYYY-MM-DD"；有 start_da 時即走日期模式
     use_rth : int
         1=正規盤, 0=含盤前盤後
+
+    時間
+    ----
+    一律美國東部 America/New_York（含 EST/EDT 夏令時）：
+      - start_da / end_da / 「今天」是美東曆日
+      - 日內 ts 為 tz-aware 美東時間
+      - 不要再用本機亞洲時區去 +8 / -4 手動搬
     """
     symbols = _normalize_codes(codes)
     bar_size_str = _as_bar_size(bar_size)
@@ -433,7 +508,7 @@ def download(
         start_da, end_da, duration,
     )
     print(
-        f"request window: endDateTime={end_dt or 'latest'!r} | "
+        f"request window (US/Eastern): endDateTime={end_dt or 'latest'!r} | "
         f"durationStr={duration_str!r} | filter={filter_start} → {filter_end}"
     )
 

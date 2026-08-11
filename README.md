@@ -1,23 +1,22 @@
 # ibkr-data
 
-Download Interactive Brokers historical OHLCV bars into a **pandas DataFrame**.
+Download data from Interactive Brokers into a **pandas DataFrame**.
 
-Requires a running **TWS** or **IB Gateway** with the socket API enabled. This library does not ship market data by itself — it talks to your local IB session.
+```
+Follow the steps, or you can simply download individual file from src/ to test functions separately
+```
 
 ## Install
 
-### From this repo (recommended while developing)
-
 ```bash
-git clone https://github.com/YOUR_USERNAME/ibkr_data_api.git
+
+# clone git repo
+git clone https://github.com/tsungyou/ibkr_data_api.git
 cd ibkr_data_api
 pip install -e .
-```
 
-### Directly from GitHub
-
-```bash
-pip install "git+https://github.com/YOUR_USERNAME/ibkr_data_api.git"
+# OR download directly
+pip install "git+https://github.com/tsungyou/ibkr_data_api.git"
 ```
 
 ### Dependencies
@@ -67,12 +66,6 @@ df = download(
 )
 ```
 
-Run the example script after `pip install -e .` and with TWS open:
-
-```bash
-python examples/basic_usage.py
-```
-
 ## API
 
 ### `download(...)`
@@ -119,32 +112,6 @@ You may still pass raw IB strings: `duration="1 Y"`, `bar_size="5 mins"`.
 - Intraday bars: time column is `ts` instead of `da`
 
 No database is required. The function returns a DataFrame only.
-
-## Limitations (v0.1)
-
-- US stocks via `STK` / `SMART` / `USD` only (no futures / HK yet)
-- One `reqHistoricalData` **per symbol** (no automatic multi-chunk for long intraday windows)
-- Very long **intraday** ranges may hit IB single-request limits — batch with `start_da` / `end_da`
-- Needs live IB market data permissions for the requested product
-
-## Development layout
-
-```text
-ibkr_data_api/
-  pyproject.toml
-  README.md
-  examples/
-  src/
-    ibkr_data/
-      __init__.py      # public exports
-      historical.py    # download / enums / IB client
-```
-
-Editable install for local work:
-
-```bash
-pip install -e ".[dev]"
-```
 
 ## License
 
